@@ -66,7 +66,12 @@ fn run(config: Config) -> ExitCode {
     thread::spawn(move || socket::run(&app_token, &events_tx));
 
     let api = web_api::WebApi::new(&config.bot_token, events_rx);
-    let threads = match Threads::open(&config.state_dir, &channel.id, api) {
+    let named: Vec<(String, String)> = config
+        .channels
+        .iter()
+        .map(|c| (c.name.clone(), c.id.clone()))
+        .collect();
+    let threads = match Threads::open_channels(&config.state_dir, &named, api) {
         Ok(threads) => Arc::new(Mutex::new(threads)),
         Err(e) => {
             eprintln!("roc-slack-door: cannot open the thread map: {e}");

@@ -7,7 +7,7 @@
 
 ## 2. Threads and reactions (`slack`)
 
-- [ ] 2.1 Serve threads as `urn:slack:channel:{name}:thread:{key}`, with keys unique per channel in the existing map (A thread is named by a key the caller chooses)
+- [x] 2.1 Serve threads as `urn:slack:channel:{name}:thread:{key}`, with keys unique per channel in the existing map (A thread is named by a key the caller chooses)
 - [ ] 2.2 Open, reply, read and refuse unknown keys per channel (Writing to a new key opens the thread)
 - [ ] 2.3 Post a top-level message on a write to `urn:slack:channel:{name}` (Writing to a channel posts a new message)
 - [ ] 2.4 Serve reactions as `urn:slack:channel:{name}:thread:{key}:reaction:{reaction}` (A reaction marks a thread's opening message)

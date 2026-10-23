@@ -103,7 +103,7 @@ impl Inbox {
                 if !self.may_speak(&channel, &user) {
                     return None;
                 }
-                let key = thread.as_deref().and_then(|root| threads.key_for(root));
+                let key = thread.as_deref().and_then(|root| threads.key_for(&channel, root));
                 Some(Delivery::Message {
                     key,
                     user,
@@ -121,7 +121,7 @@ impl Inbox {
                 if !self.may_speak(&channel, &user) {
                     return None;
                 }
-                let key = threads.key_for(&message)?;
+                let key = threads.key_for(&channel, &message)?;
                 Some(Delivery::Reaction { key, user, name })
             }
         }

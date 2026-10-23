@@ -52,14 +52,25 @@ fn from_transport(error: TransportError) -> ThreadError {
 /// The threads a door holds, over one transport and one configured channel.
 pub struct Threads<T: SlackTransport> {
     state_dir: PathBuf,
-    channel: String,
+    /// The declared channels as (name, Slack id); the first is the one the unscoped calls use.
+    channels: Vec<(String, String)>,
     transport: T,
-    threads: BTreeMap<String, Thread>,
+    /// Keyed by channel id and then key, so a key is unique within its channel.
+    threads: BTreeMap<(String, String), Thread>,
 }
 
 impl<T: SlackTransport> Threads<T> {
     /// Opens the map in `state_dir`, creating the directory and an empty map when there is none.
     pub fn open(state_dir: &Path, channel: &str, transport: T) -> io::Result<Self> {
+        Self::open_channels(state_dir, &[(String::new(), channel.to_owned())], transport)
+    }
+
+    /// Opens the map for the declared `channels`, each a (name, Slack id) pair.
+    pub fn open_channels(
+        state_dir: &Path,
+        channels: &[(String, String)],
+        transport: T,
+    ) -> io::Result<Self> {
         fs::create_dir_all(state_dir)?;
         let threads = match fs::read_to_string(state_dir.join(MAP_FILE)) {
             Ok(text) => parse(&text)?,
@@ -68,29 +79,77 @@ impl<T: SlackTransport> Threads<T> {
         };
         Ok(Self {
             state_dir: state_dir.to_owned(),
-            channel: channel.to_owned(),
+            channels: channels.to_vec(),
             transport,
             threads,
         })
     }
 
+    /// The Slack id of the declared channel `name`, or `no-channel`.
+    fn id_of(&self, name: &str) -> Result<String, ThreadError> {
+        self.channels
+            .iter()
+            .find(|(declared, _)| declared == name)
+            .map(|(_, id)| id.clone())
+            .ok_or_else(|| ThreadError::Refused(Refusal::NoChannel(name.to_owned())))
+    }
+
+    /// The id of the channel the unscoped calls use.
+    fn default_id(&self) -> String {
+        self.channels[0].1.clone()
+    }
+
+    /// `write` in the declared channel `channel`.
+    pub fn write_in(
+        &mut self,
+        grants: &Grants,
+        channel: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<(), ThreadError> {
+        let id = self.id_of(channel)?;
+        self.write_at(grants, &id, key, text)
+    }
+
+    /// `read` in the declared channel `channel`.
+    pub fn read_in(
+        &mut self,
+        grants: &Grants,
+        channel: &str,
+        key: &str,
+    ) -> Result<Vec<Entry>, ThreadError> {
+        let id = self.id_of(channel)?;
+        self.read_at(grants, &id, key)
+    }
+
     /// Writes `text` to the thread `key` names. A key with no thread opens one as a new top-level
     /// message and records it; a key with a thread replies in it.
     pub fn write(&mut self, grants: &Grants, key: &str, text: &str) -> Result<(), ThreadError> {
+        let id = self.default_id();
+        self.write_at(grants, &id, key, text)
+    }
+
+    fn write_at(
+        &mut self,
+        grants: &Grants,
+        channel: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<(), ThreadError> {
         grants.require(POST).map_err(ThreadError::Refused)?;
         check_key(key).map_err(ThreadError::Refused)?;
         check_text(text).map_err(ThreadError::Refused)?;
-        let parent = self.threads.get(key).map(|thread| thread.ts.clone());
+        let parent = self.threads.get(&slot(channel, key)).map(|thread| thread.ts.clone());
         let ts = self
             .transport
-            .post(&self.channel, parent.as_deref(), text)
+            .post(channel, parent.as_deref(), text)
             .map_err(from_transport)?;
         if parent.is_none() {
             let thread = Thread {
-                channel: self.channel.clone(),
+                channel: channel.to_owned(),
                 ts,
             };
-            self.threads.insert(key.to_owned(), thread);
+            self.threads.insert(slot(channel, key), thread);
             self.save().map_err(ThreadError::State)?;
         }
         Ok(())
@@ -110,35 +169,41 @@ impl<T: SlackTransport> Threads<T> {
         check_reaction(name).map_err(ThreadError::Refused)?;
         let thread = self
             .threads
-            .get(key)
+            .get(&slot(&self.default_id(), key))
             .ok_or(ThreadError::Refused(Refusal::NoThread))?;
         self.transport
             .react(&thread.channel, &thread.ts, name, add)
             .map_err(from_transport)
     }
 
-    /// The key of the thread whose opening message has timestamp `ts`, if the door opened one.
-    pub fn key_for(&self, ts: &str) -> Option<String> {
+    /// The key of the thread in channel id `channel` whose opening message has timestamp `ts`, if
+    /// the door opened one: timestamps are unique only within a channel.
+    pub fn key_for(&self, channel: &str, ts: &str) -> Option<String> {
         self.threads
             .iter()
-            .find(|(_, thread)| thread.ts == ts)
-            .map(|(key, _)| key.clone())
+            .find(|(_, thread)| thread.channel == channel && thread.ts == ts)
+            .map(|((_, key), _)| key.clone())
     }
 
     /// Whether the key names a thread the door has opened.
     pub fn exists(&self, grants: &Grants, key: &str) -> Result<bool, ThreadError> {
         grants.require(READ).map_err(ThreadError::Refused)?;
         check_key(key).map_err(ThreadError::Refused)?;
-        Ok(self.threads.contains_key(key))
+        Ok(self.threads.contains_key(&slot(&self.default_id(), key)))
     }
 
     /// The conversation the key names, the opening message first.
     pub fn read(&mut self, grants: &Grants, key: &str) -> Result<Vec<Entry>, ThreadError> {
+        let id = self.default_id();
+        self.read_at(grants, &id, key)
+    }
+
+    fn read_at(&mut self, grants: &Grants, channel: &str, key: &str) -> Result<Vec<Entry>, ThreadError> {
         grants.require(READ).map_err(ThreadError::Refused)?;
         check_key(key).map_err(ThreadError::Refused)?;
         let thread = self
             .threads
-            .get(key)
+            .get(&slot(channel, key))
             .ok_or(ThreadError::Refused(Refusal::NoThread))?;
         let messages = self
             .transport
@@ -162,7 +227,7 @@ impl<T: SlackTransport> Threads<T> {
     fn save(&self) -> io::Result<()> {
         let tmp = self.state_dir.join("threads.tsv.tmp");
         let mut file = fs::File::create(&tmp)?;
-        for (key, thread) in &self.threads {
+        for ((_, key), thread) in &self.threads {
             writeln!(file, "{key}\t{}\t{}", thread.channel, thread.ts)?;
         }
         file.sync_all()?;
@@ -170,13 +235,18 @@ impl<T: SlackTransport> Threads<T> {
     }
 }
 
-fn parse(text: &str) -> io::Result<BTreeMap<String, Thread>> {
+/// The map's index for a key in a channel.
+fn slot(channel: &str, key: &str) -> (String, String) {
+    (channel.to_owned(), key.to_owned())
+}
+
+fn parse(text: &str) -> io::Result<BTreeMap<(String, String), Thread>> {
     text.lines()
         .map(|line| {
             let fields: Vec<&str> = line.split('\t').collect();
             match fields.as_slice() {
                 [key, channel, ts] => Ok((
-                    (*key).to_owned(),
+                    slot(channel, key),
                     Thread {
                         channel: (*channel).to_owned(),
                         ts: (*ts).to_owned(),
@@ -205,6 +275,19 @@ mod tests {
 
     fn all() -> Grants {
         Grants::all()
+    }
+
+    #[test]
+    fn key_for_tells_equal_timestamps_in_two_channels_apart() {
+        let dir = scratch("key-for");
+        let channels = [("a".to_owned(), "C1".to_owned()), ("b".to_owned(), "C2".to_owned())];
+        let mut threads = Threads::open_channels(&dir, &channels, FakeSlack::new()).unwrap();
+        for (channel, key) in [("C1", "one"), ("C2", "two")] {
+            let thread = Thread { channel: channel.to_owned(), ts: "1.0".to_owned() };
+            threads.threads.insert(slot(channel, key), thread);
+        }
+        assert_eq!(threads.key_for("C1", "1.0").as_deref(), Some("one"));
+        assert_eq!(threads.key_for("C2", "1.0").as_deref(), Some("two"));
     }
 
     #[test]

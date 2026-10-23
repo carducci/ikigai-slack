@@ -125,6 +125,52 @@ impl<T: SlackTransport + Send + 'static> Endpoint for ThreadEndpoint<T> {
     }
 }
 
+/// `urn:slack:channel:{name}:thread:{key}`: sourcing reads the conversation, sinking posts to it.
+pub struct ChannelThreadEndpoint<T: SlackTransport> {
+    threads: Shared<T>,
+    declared: Vec<String>,
+}
+
+#[async_trait]
+impl<T: SlackTransport + Send + 'static> Endpoint for ChannelThreadEndpoint<T> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let channel = inv.bindings.get("name").unwrap_or_default();
+        let key = inv.bindings.get("key").unwrap_or_default();
+        let grants = grants_of(inv.capability);
+        let mut threads = self
+            .threads
+            .lock()
+            .map_err(|_| Error::Endpoint("the thread map is poisoned".to_owned()))?;
+        match inv.request.verb {
+            Verb::Source => {
+                let entries = threads.read_in(&grants, channel, key).map_err(to_error)?;
+                Ok(Representation::new(
+                    ReprType::new("application/json"),
+                    to_json(&entries).into_bytes(),
+                ))
+            }
+            Verb::Sink => {
+                check_channel(&self.declared, channel)
+                    .map_err(|refusal| to_error(ThreadError::Refused(refusal)))?;
+                let text = text_of(inv)?;
+                threads.write_in(&grants, channel, key, &text).map_err(to_error)?;
+                Ok(ok_text("posted"))
+            }
+            other => {
+                check_channel(&self.declared, channel)
+                    .map_err(|refusal| to_error(ThreadError::Refused(refusal)))?;
+                Err(Error::Endpoint(format!(
+                    "urn:slack:channel:{{name}}:thread takes source and sink, not {other:?}"
+                )))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "urn:slack:channel:thread"
+    }
+}
+
 /// `urn:slack:thread:{key}:reaction:{name}`: sinking adds the reaction, deleting removes it.
 pub struct ReactionEndpoint<T: SlackTransport> {
     threads: Shared<T>,
@@ -167,10 +213,13 @@ pub struct ChannelEndpoint {
 #[async_trait]
 impl Endpoint for ChannelEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let rest = inv.bindings.get("rest").unwrap_or_default();
+        let rest = inv.bindings.get("rest").or(inv.bindings.get("name")).unwrap_or_default();
         let name = rest.split(':').next().unwrap_or_default();
         check_channel(&self.declared, name)
             .map_err(|refusal| to_error(ThreadError::Refused(refusal)))?;
+        if rest.split(':').skip(1).eq(["thread", ""]) {
+            return Err(to_error(ThreadError::Refused(Refusal::BadKey)));
+        }
         Err(Error::NotFound(format!("`{rest}` is not served yet")))
     }
 
@@ -186,6 +235,20 @@ pub fn slack_space<T: SlackTransport + Send + 'static>(
     declared: Vec<String>,
 ) -> EndpointSpace {
     EndpointSpace::new()
+        .bind(
+            UriTemplate::parse("urn:slack:channel:{name}:thread:{key}:reaction:{reaction}")
+                .expect("a fixed template"),
+            ChannelEndpoint {
+                declared: declared.clone(),
+            },
+        )
+        .bind(
+            UriTemplate::parse("urn:slack:channel:{name}:thread:{key}").expect("a fixed template"),
+            ChannelThreadEndpoint {
+                threads: Arc::clone(&threads),
+                declared: declared.clone(),
+            },
+        )
         .bind(
             UriTemplate::parse("urn:slack:channel:{rest}").expect("a fixed template"),
             ChannelEndpoint { declared },
@@ -294,6 +357,65 @@ mod tests {
             request = request.with_arg("content", ArgRef::Inline(b"hello".to_vec()));
         }
         futures_executor::block_on(kernel.issue(request, &Capability::root()))
+    }
+
+    fn two_channel_door(name: &str) -> (Kernel, Shared<FakeSlack>) {
+        let dir = std::env::temp_dir().join(format!("roc-door-serve-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let channels = [
+            ("gonk-chat".to_owned(), "C1".to_owned()),
+            ("fixme".to_owned(), "C2".to_owned()),
+        ];
+        let threads = Arc::new(Mutex::new(
+            Threads::open_channels(&dir, &channels, FakeSlack::new()).unwrap(),
+        ));
+        let declared = vec!["gonk-chat".to_owned(), "fixme".to_owned()];
+        let kernel = kernel(Arc::clone(&threads), dir.join("spaces"), declared);
+        (kernel, threads)
+    }
+
+    #[test]
+    fn a_key_with_a_space_in_a_channel_is_refused_as_bad_key() {
+        let (kernel, threads) = two_channel_door("bad-key");
+        let error = issue(&kernel, Verb::Sink, "urn:slack:channel:gonk-chat:thread:item%2054")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("key"), "{error}");
+        assert!(threads.lock().unwrap().transport().posts().is_empty());
+    }
+
+    #[test]
+    fn an_empty_key_in_a_channel_is_refused_as_bad_key() {
+        let (kernel, _) = two_channel_door("empty-key");
+        let error = issue(&kernel, Verb::Sink, "urn:slack:channel:gonk-chat:thread:")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("key") && !error.contains("not served"), "{error}");
+    }
+
+    #[test]
+    fn a_sink_without_text_to_an_undeclared_channel_is_refused_as_no_channel() {
+        let (kernel, _) = two_channel_door("no-text");
+        let request = Request::new(Verb::Sink, Iri::parse("urn:slack:channel:random:thread:x").unwrap());
+        let error = futures_executor::block_on(kernel.issue(request, &Capability::root()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no-channel"), "{error}");
+    }
+
+    #[test]
+    fn the_same_key_in_two_channels_opens_two_threads() {
+        let (kernel, threads) = two_channel_door("two-channels");
+        issue(&kernel, Verb::Sink, "urn:slack:channel:gonk-chat:thread:x").unwrap();
+        issue(&kernel, Verb::Sink, "urn:slack:channel:fixme:thread:x").unwrap();
+        let posts = threads.lock().unwrap().transport().posts();
+        assert_eq!(posts.len(), 2);
+        assert!(posts.iter().all(|post| post.thread.is_none()));
+        assert_eq!((posts[0].channel.as_str(), posts[1].channel.as_str()), ("C1", "C2"));
+        issue(&kernel, Verb::Sink, "urn:slack:channel:fixme:thread:x").unwrap();
+        let posts = threads.lock().unwrap().transport().posts();
+        assert_eq!(posts[2].thread.as_deref(), Some(posts[1].ts.as_str()));
     }
 
     #[test]
