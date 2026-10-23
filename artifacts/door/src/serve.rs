@@ -114,8 +114,17 @@ impl<T: SlackTransport + Send + 'static> Endpoint for ThreadEndpoint<T> {
                     .map_err(to_error)?;
                 Ok(ok_text("posted"))
             }
+            Verb::Exists => {
+                let open = self
+                    .threads
+                    .lock()
+                    .map_err(|_| Error::Endpoint("the thread map is poisoned".to_owned()))?
+                    .exists(&grants, key)
+                    .map_err(to_error)?;
+                Ok(ok_text(if open { "true" } else { "false" }))
+            }
             other => Err(Error::Endpoint(format!(
-                "urn:slack:thread takes source and sink, not {other:?}"
+                "urn:slack:thread takes source, sink and exists, not {other:?}"
             ))),
         }
     }
@@ -312,6 +321,18 @@ mod tests {
         }
         assert!(threads.lock().unwrap().transport().posts().is_empty());
         assert!(threads.lock().unwrap().transport().reactions().is_empty());
+    }
+
+    #[test]
+    fn exists_through_the_door_answers_for_a_closed_and_an_open_thread() {
+        let (kernel, _threads) = door("exists");
+        let answer = |iri| {
+            let reply = issue(&kernel, Verb::Exists, iri).unwrap();
+            String::from_utf8(reply.bytes.to_vec()).unwrap()
+        };
+        assert_eq!(answer("urn:slack:thread:never-opened"), "false\n");
+        issue(&kernel, Verb::Sink, "urn:slack:thread:k").unwrap();
+        assert_eq!(answer("urn:slack:thread:k"), "true\n");
     }
 
     #[test]
